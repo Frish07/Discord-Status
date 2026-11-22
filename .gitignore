@@ -4,3 +4,5 @@
 *.tmp
 *.user
 /.vs/
+__pycache__/
+*.pyc
