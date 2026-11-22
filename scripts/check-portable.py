@@ -120,7 +120,8 @@ def launch_check(exe):
                                         wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
     psapi.GetModuleFileNameExW.argtypes = [wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
     env = os.environ.copy()
-    system = Path(env['SystemRoot']).resolve()
+    # os.environ is case-insensitive on Windows; its plain dict copy is not.
+    system = Path(os.environ['SystemRoot']).resolve()
     env['PATH'] = str(system / 'System32') + os.pathsep + str(system)
     env.pop('QT_PLUGIN_PATH', None)
     startup = subprocess.STARTUPINFO()
