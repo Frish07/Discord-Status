@@ -38,6 +38,13 @@ int main() {
         fill(second); SetWindowTextW(entryLabel,L"Второй"); SetWindowTextW(entrySeconds,L"20");
         changePlaylist(120);
         expect(load(settingsPath).playlist.size()==2,"Playlist did not persist with the profile");
+        SendMessageW(playlistList,LB_SETCURSEL,0,0); selectMetadata();
+        expect(readForm().largeImage.empty(),"Selecting a row did not load its own presence fields");
+        SetWindowTextW(entrySeconds,L"45"); changePlaylist(121);
+        expect(playlist[0].seconds==45 && playlist[0].presence.largeImage.empty(),
+            "Editing duration overwrote the selected entry with another status");
+        SetWindowTextW(entrySeconds,L"15"); changePlaylist(121);
+        SendMessageW(playlistList,LB_SETCURSEL,1,0); selectMetadata();
         changePlaylist(124); expect(playlist[0].label=="Второй","Move up failed");
         changePlaylist(125); expect(playlist[1].label=="Второй","Move down failed");
         startCycle(); expect(player.isPlaying() && active.largeImage.empty(),"Cycle did not start at first entry");

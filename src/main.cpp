@@ -178,6 +178,9 @@ void selectMetadata() {
         const auto& entry=playlist[static_cast<size_t>(selected)];
         SetWindowTextW(entryLabel,wide(entry.label).c_str());
         SetWindowTextW(entrySeconds,std::to_wstring(entry.seconds).c_str());
+        fill(entry.presence);
+    } else {
+        SetWindowTextW(entryLabel,L""); SetWindowTextW(entrySeconds,L"60");
     }
     bool found=selected>=0 && static_cast<size_t>(selected)<playlist.size();
     for (int slot:{12,13,14}) EnableWindow(buttons[slot],found);
@@ -191,7 +194,7 @@ void refreshPlaylist(int selection) {
         auto label=wide(entry.label)+L" — "+std::to_wstring(entry.seconds)+L" сек.";
         SendMessageW(playlistList,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(label.c_str()));
     }
-    if (!playlist.empty()) SendMessageW(playlistList,LB_SETCURSEL,
+    if (!playlist.empty() && selection>=0) SendMessageW(playlistList,LB_SETCURSEL,
         std::min(std::max(0,selection),static_cast<int>(playlist.size())-1),0);
     selectMetadata(); repaint();
 }
