@@ -2,8 +2,8 @@
 1 ICON "app.ico"
 1 RT_MANIFEST "app.manifest"
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,1,0,0
- PRODUCTVERSION 1,1,0,0
+ FILEVERSION 1,2,0,0
+ PRODUCTVERSION 1,2,0,0
  FILEFLAGSMASK 0x3fL
  FILEOS VOS_NT_WINDOWS32
  FILETYPE VFT_APP
@@ -14,11 +14,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "Frish07\0"
       VALUE "FileDescription", "Presence Studio - Discord Rich Presence Manager\0"
-      VALUE "FileVersion", "1.1.0\0"
+      VALUE "FileVersion", "1.2.0\0"
       VALUE "InternalName", "DiscordPresenceManager\0"
       VALUE "OriginalFilename", "DiscordPresenceManager.exe\0"
       VALUE "ProductName", "Presence Studio\0"
-      VALUE "ProductVersion", "1.1.0\0"
+      VALUE "ProductVersion", "1.2.0\0"
       VALUE "LegalCopyright", "Copyright (c) 2026 Frish07\0"
     END
   END

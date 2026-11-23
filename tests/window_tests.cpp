@@ -7,7 +7,7 @@ int main() {
     try {
         canvas=std::make_unique<design::Canvas>();
         inputBrush=CreateSolidBrush(RGB(13,20,32));
-        settingsPath=std::filesystem::temp_directory_path()/(L"presence-ui-test-"+std::to_wstring(GetCurrentProcessId())+L".json");
+        settingsPath=std::filesystem::current_path()/(L"presence-ui-test-"+std::to_wstring(GetCurrentProcessId())+L".json");
         INITCOMMONCONTROLSEX common{sizeof common,ICC_STANDARD_CLASSES}; InitCommonControlsEx(&common);
         WNDCLASSW cls{}; cls.lpfnWndProc=procedure; cls.hInstance=GetModuleHandleW(nullptr);
         cls.lpszClassName=L"PresenceStudioLifecycleTest"; RegisterClassW(&cls);
@@ -32,6 +32,30 @@ int main() {
         }
         expect(rotation==1,"Text rotation stopped while hidden");
         expect(epoch==12345 && running,"Hidden timer changed its start epoch");
+        SetWindowTextW(entryLabel,L"Первый"); SetWindowTextW(entrySeconds,L"15");
+        changePlaylist(120);
+        auto second=active; second.name="Second status"; second.largeImage="second-cover"; second.timer=2; second.minutes=5;
+        fill(second); SetWindowTextW(entryLabel,L"Второй"); SetWindowTextW(entrySeconds,L"20");
+        changePlaylist(120);
+        expect(load(settingsPath).playlist.size()==2,"Playlist did not persist with the profile");
+        changePlaylist(124); expect(playlist[0].label=="Второй","Move up failed");
+        changePlaylist(125); expect(playlist[1].label=="Второй","Move down failed");
+        startCycle(); expect(player.isPlaying() && active.largeImage.empty(),"Cycle did not start at first entry");
+        player.start(playlist,GetTickCount64()-14900);
+        activateCycleEntry(GetTickCount64());
+        auto switchUntil=GetTickCount64()+1250;
+        while (GetTickCount64()<switchUntil) {
+            MSG msg;
+            while (PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+            Sleep(10);
+        }
+        expect(player.currentIndex()==1 && active.largeImage=="second-cover" && active.timer==2,
+            "Hidden window did not switch the complete presence snapshot");
+        stopCycle(); expect(running && !player.isPlaying(),"Stopping the cycle removed the current presence");
+        startCycle(); pausePresence();
+        expect(!running && !player.isPlaying(),"Hide did not disable automatic republishing");
+        SendMessageW(hwnd,WM_COMMAND,113,0);
+        expect(page==3 && (GetWindowLongW(playlistList,GWL_STYLE)&WS_VISIBLE),"Playlist tab unavailable");
         SendMessageW(hwnd,WM_COMMAND,111,0);
         expect(page==1 && (GetWindowLongW(fields[4],GWL_STYLE)&WS_VISIBLE),"Images page unavailable");
         expect(!(GetWindowLongW(fields[0],GWL_STYLE)&WS_VISIBLE),"Hidden page participates in UI");
@@ -42,8 +66,9 @@ int main() {
         expect(dpi==144 && face.lfHeight==-24,"Font did not rescale for monitor DPI");
         SendMessageW(hwnd,WM_COMMAND,ExitCommand,0);
         expect(!IsWindow(hwnd) && !rpc && !trayAdded,"Explicit exit leaked worker/window/tray icon");
+        std::filesystem::remove(settingsPath);
         DeleteObject(font); DeleteObject(inputBrush); canvas.reset();
-        std::cout<<"Tray close, background rotation, tabs, DPI fonts and explicit exit passed\n";
+        std::cout<<"Tray, background playlist snapshots, persistence, reorder, stop/hide, tabs, DPI and exit passed\n";
         return 0;
     } catch (const std::exception& e) {
         if (window && IsWindow(window)) exitApplication();

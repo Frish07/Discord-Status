@@ -14,6 +14,10 @@ try {
     if ($LASTEXITCODE) { throw 'Test compilation failed' }
     & "./$OutputDirectory/presence_tests.exe"
     if ($LASTEXITCODE) { throw 'Tests failed' }
+    & $compiler.Source -std=c++17 -O2 -Wall -Wextra -Wpedantic -Isrc -Ithird_party tests/playlist_tests.cpp -static -o "$OutputDirectory/playlist_tests.exe"
+    if ($LASTEXITCODE) { throw 'Playlist test compilation failed' }
+    & "./$OutputDirectory/playlist_tests.exe"
+    if ($LASTEXITCODE) { throw 'Playlist tests failed' }
     & (Join-Path (Split-Path $compiler.Source) 'windres.exe') -Iassets assets/app.rc -O coff -o "$OutputDirectory/app-resources.o"
     if ($LASTEXITCODE) { throw 'Resource compilation failed' }
     $uiFlags = @('-std=c++17', '-O2', '-Wall', '-Wextra', '-Wpedantic', '-D_WIN32_WINNT=0x0A00', '-DWINVER=0x0A00', '-Isrc', '-Ithird_party')

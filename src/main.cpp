@@ -19,13 +19,14 @@
 #include <memory>
 #include "ipc.hpp"
 #include "design.hpp"
+#include "playlist.hpp"
 
 namespace {
 using design::Box;
 constexpr UINT StatusMessage = WM_APP+1, TrayMessage = WM_APP+2, RestoreMessage = WM_APP+3;
 constexpr int ShowCommand = 401, PauseCommand = 402, ExitCommand = 403;
 constexpr float ContentHeight = 752;
-HWND window{}, fields[11]{}, buttons[12]{};
+HWND window{}, fields[11]{}, buttons[19]{}, playlistList{}, entryLabel{}, entrySeconds{};
 HFONT font{};
 HBRUSH inputBrush{};
 UINT dpi = 96, taskbarCreated{};
@@ -36,6 +37,9 @@ bool shuttingDown = false;
 std::unique_ptr<design::Canvas> canvas;
 std::unique_ptr<DiscordIpc> rpc;
 presence::Settings active;
+presence::Settings savedDraft;
+std::vector<presence::PlaylistEntry> playlist;
+presence::PlaylistPlayer player;
 size_t rotation = 0;
 int64_t epoch = 0;
 ULONGLONG lastRotation = 0;
@@ -59,22 +63,26 @@ std::string utf8(const std::wstring& s) {
     std::string result(n,0); WideCharToMultiByte(CP_UTF8,0,s.data(),static_cast<int>(s.size()),result.data(),n,nullptr,nullptr);
     return result;
 }
-std::string value(int i) {
-    int n = GetWindowTextLengthW(fields[i]);
-    std::wstring text(n+1,0); GetWindowTextW(fields[i],text.data(),n+1); text.resize(n);
+std::string controlValue(HWND item) {
+    int n = GetWindowTextLengthW(item);
+    std::wstring text(n+1,0); GetWindowTextW(item,text.data(),n+1); text.resize(n);
     return utf8(text);
 }
-int number(int i) {
-    auto text = value(i); size_t consumed = 0;
+std::string value(int i) { return controlValue(fields[i]); }
+int controlNumber(HWND item) {
+    auto text = controlValue(item); size_t consumed = 0;
     try { int n = std::stoi(text,&consumed); if (consumed == text.size()) return n; } catch (...) {}
-    throw std::runtime_error("Минуты и интервал должны быть целыми числами.");
+    throw std::runtime_error("Время и интервал должны быть целыми числами.");
 }
-presence::Settings readForm() {
+int number(int i) { return controlNumber(fields[i]); }
+presence::Settings readForm(bool check=true) {
     presence::Settings s;
     s.clientId=value(0); s.name=value(1); s.details=value(2); s.state=value(3);
     s.largeImage=value(4); s.largeText=value(5); s.smallImage=value(6); s.smallText=value(7);
     s.timer=static_cast<int>(SendMessageW(fields[8],CB_GETCURSEL,0,0));
-    s.minutes=number(9); s.interval=number(10); presence::validate(s); return s;
+    s.minutes=number(9); s.interval=number(10);
+    if (check) presence::validate(s);
+    return s;
 }
 void fill(const presence::Settings& s) {
     std::string values[]={s.clientId,s.name,s.details,s.state,s.largeImage,s.largeText,s.smallImage,s.smallText};
@@ -85,20 +93,27 @@ void fill(const presence::Settings& s) {
 }
 void save(const std::filesystem::path& path,const presence::Settings& s) {
     auto temp=path; temp+=L".tmp";
-    { std::ofstream file(temp,std::ios::binary|std::ios::trunc); file<<presence::json(s).dump(2); file.flush();
+    { std::ofstream file(temp,std::ios::binary|std::ios::trunc); file<<presence::json(presence::Profile{s,playlist}).dump(2); file.flush();
       if (!file) throw std::runtime_error("Не удалось записать настройки."); }
     if (!MoveFileExW(temp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))
         throw std::runtime_error("Не удалось сохранить файл настроек.");
 }
-presence::Settings load(const std::filesystem::path& path) {
-    if (std::filesystem::file_size(path)>128*1024) throw std::runtime_error("Слишком большой файл профиля.");
+presence::Profile load(const std::filesystem::path& path) {
+    if (std::filesystem::file_size(path)>4*1024*1024) throw std::runtime_error("Слишком большой файл профиля (максимум 4 МБ).");
     std::ifstream file(path,std::ios::binary);
-    auto s=presence::json::parse(file).get<presence::Settings>(); presence::validate(s); return s;
+    return presence::json::parse(file).get<presence::Profile>();
 }
-void repaint() { if (IsWindowVisible(window)) InvalidateRect(window,nullptr,FALSE); }
+void layout();
+void refreshPlaylist(int selection=-1);
+void repaint() {
+    if (buttons[18]) EnableWindow(buttons[18],player.isPlaying());
+    if (IsWindowVisible(window)) InvalidateRect(window,nullptr,FALSE);
+}
 void updateTray() {
     if (!trayAdded) return;
-    std::wstring tip=L"Presence Studio — "+status;
+    std::wstring tip=L"Presence Studio — ";
+    if (player.isPlaying()) tip+=wide(player.current().label)+L" · ";
+    tip+=status;
     wcsncpy_s(tray.szTip,tip.c_str(),_TRUNCATE);
     tray.uFlags=NIF_TIP|NIF_SHOWTIP; Shell_NotifyIconW(NIM_MODIFY,&tray);
 }
@@ -125,11 +140,12 @@ void minimizeToTray() {
     }
 }
 void pausePresence() {
-    running=false; rpc->update(active.clientId,nullptr);
+    player.stop(); running=false; rpc->update(active.clientId,nullptr);
     status=L"Скрытие активности в очереди…"; updateTray(); repaint();
 }
 void publish(bool reset) {
-    auto s=readForm(); save(settingsPath,s); active=s;
+    auto s=readForm(); save(settingsPath,s); savedDraft=s;
+    player.stop(); active=s;
     if (reset || !running) { epoch=static_cast<int64_t>(time(nullptr)); rotation=0; }
     running=true; lastRotation=GetTickCount64();
     rpc->update(active.clientId,presence::activity(active,rotation,epoch));
@@ -142,10 +158,90 @@ void profile(bool exporting) {
     dialog.lpstrFile=path; dialog.nMaxFile=32768; dialog.lpstrDefExt=L"json";
     dialog.Flags=OFN_EXPLORER|OFN_NOCHANGEDIR|(exporting?OFN_OVERWRITEPROMPT:OFN_FILEMUSTEXIST);
     if (exporting?GetSaveFileNameW(&dialog):GetOpenFileNameW(&dialog)) {
-        if (exporting) save(path,readForm()); else fill(load(path));
+        if (exporting) {
+            auto draft=readForm(false);
+            if (!draft.clientId.empty()) presence::validate(draft);
+            save(path,draft);
+        } else {
+            auto loaded=load(path);
+            player.stop(); savedDraft=loaded.draft; playlist=std::move(loaded.playlist);
+            fill(savedDraft); refreshPlaylist();
+        }
         status=exporting?L"Профиль сохранён. Ваш стиль всегда под рукой.":L"Профиль загружен. Нажмите «Применить», чтобы включить его.";
         updateTray(); repaint();
     }
+}
+int selectedEntry() { return static_cast<int>(SendMessageW(playlistList,LB_GETCURSEL,0,0)); }
+void selectMetadata() {
+    int selected=selectedEntry();
+    if (selected>=0 && static_cast<size_t>(selected)<playlist.size()) {
+        const auto& entry=playlist[static_cast<size_t>(selected)];
+        SetWindowTextW(entryLabel,wide(entry.label).c_str());
+        SetWindowTextW(entrySeconds,std::to_wstring(entry.seconds).c_str());
+    }
+    bool found=selected>=0 && static_cast<size_t>(selected)<playlist.size();
+    for (int slot:{12,13,14}) EnableWindow(buttons[slot],found);
+    EnableWindow(buttons[15],found && selected>0);
+    EnableWindow(buttons[16],found && static_cast<size_t>(selected)+1<playlist.size());
+    EnableWindow(buttons[17],!playlist.empty());
+}
+void refreshPlaylist(int selection) {
+    SendMessageW(playlistList,LB_RESETCONTENT,0,0);
+    for (const auto& entry:playlist) {
+        auto label=wide(entry.label)+L" — "+std::to_wstring(entry.seconds)+L" сек.";
+        SendMessageW(playlistList,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(label.c_str()));
+    }
+    if (!playlist.empty()) SendMessageW(playlistList,LB_SETCURSEL,
+        std::min(std::max(0,selection),static_cast<int>(playlist.size())-1),0);
+    selectMetadata(); repaint();
+}
+void stopCycle() {
+    player.stop();
+    status=L"Автосмена остановлена. Текущий статус остаётся в Discord.";
+    updateTray(); repaint();
+}
+void activateCycleEntry(ULONGLONG now) {
+    active=player.current().presence; running=true; rotation=0;
+    epoch=static_cast<int64_t>(time(nullptr)); lastRotation=now;
+    rpc->update(active.clientId,presence::activity(active,rotation,epoch));
+    status=L"Автосмена: "+wide(player.current().label)+L" — "+std::to_wstring(player.current().seconds)+L" сек.";
+    updateTray(); repaint();
+}
+void startCycle() {
+    presence::validate(playlist);
+    if (playlist.empty()) throw std::runtime_error("Добавьте хотя бы один статус в список.");
+    save(settingsPath,savedDraft);
+    auto now=GetTickCount64(); player.start(playlist,now); activateCycleEntry(now);
+}
+void changePlaylist(int command) {
+    int selected=selectedEntry();
+    auto changed=playlist;
+    auto draftToSave=savedDraft;
+    if (command==120 || command==121) {
+        auto settings=readForm();
+        draftToSave=settings;
+        auto label=controlValue(entryLabel);
+        if (label.empty()) label=settings.name.empty()?"Статус "+std::to_string(playlist.size()+1):settings.name;
+        presence::PlaylistEntry entry{label,controlNumber(entrySeconds),settings};
+        if (command==120) { changed.push_back(std::move(entry)); selected=static_cast<int>(changed.size())-1; }
+        else {
+            if (selected<0) throw std::runtime_error("Сначала выберите статус в списке.");
+            changed.at(static_cast<size_t>(selected))=std::move(entry);
+        }
+    } else {
+        if (selected<0) return;
+        if (command==122) changed.erase(changed.begin()+selected);
+        if (command==124 && selected>0) { std::swap(changed[selected],changed[selected-1]); --selected; }
+        if (command==125 && static_cast<size_t>(selected)+1<changed.size()) { std::swap(changed[selected],changed[selected+1]); ++selected; }
+    }
+    presence::validate(changed);
+    // Persist first; a disk error leaves the old list and playback intact.
+    auto previous=playlist; playlist=std::move(changed);
+    try { save(settingsPath,draftToSave); } catch (...) { playlist=std::move(previous); throw; }
+    savedDraft=std::move(draftToSave);
+    player.stop(); refreshPlaylist(selected);
+    status=L"Список сохранён. Нажмите «Запустить цикл», чтобы включить автосмену.";
+    updateTray(); repaint();
 }
 void exitApplication() {
     if (shuttingDown) return;
@@ -194,17 +290,28 @@ void layout() {
         else { b.x+=12; b.y+=10; b.w-=24; b.h-=20; }
         move(fields[i],b); ShowWindow(fields[i],fieldPage(i)==page?SW_SHOW:SW_HIDE);
     }
-    move(buttons[0],{32,112,154,40}); move(buttons[1],{194,112,174,40}); move(buttons[2],{376,112,132,40});
+    move(buttons[0],{32,112,114,40}); move(buttons[1],{154,112,164,40}); move(buttons[2],{326,112,110,40});
+    move(buttons[10],{444,112,176,40});
     move(buttons[3],{56+inner-140,294,140,42}); ShowWindow(buttons[3],page==0?SW_SHOW:SW_HIDE);
-    move(buttons[4],{32,640,196,46}); move(buttons[5],{240,640,148,46});
+    move(buttons[4],{32,640,196,46}); move(buttons[5],{page==3?432.f:240.f,640,148,46});
     move(buttons[6],{400,640,174,46});
+    ShowWindow(buttons[4],page==3?SW_HIDE:SW_SHOW); ShowWindow(buttons[6],page==3?SW_HIDE:SW_SHOW);
     move(buttons[7],{rightX(),112,160,40}); move(buttons[8],{rightX()+172,112,160,40});
     move(buttons[9],{width-198,31,166,36});
+    move(playlistList,{56,272,inner,140});
+    move(entryLabel,{68,452,inner-202,22}); move(entrySeconds,{56+inner-158,452,146,22});
+    move(buttons[11],{56,498,140,38}); move(buttons[12],{206,498,140,38}); move(buttons[13],{356,498,128,38});
+    move(buttons[14],{56,548,190,36}); move(buttons[15],{258,548,94,36}); move(buttons[16],{364,548,94,36});
+    move(buttons[17],{32,640,196,46}); move(buttons[18],{240,640,180,46});
+    for (int slot=11;slot<=18;++slot) ShowWindow(buttons[slot],page==3?SW_SHOW:SW_HIDE);
+    for (HWND item:{playlistList,entryLabel,entrySeconds}) ShowWindow(item,page==3?SW_SHOW:SW_HIDE);
     repaint();
 }
 void updateFonts() {
     HFONT next=CreateFontW(-px(16),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     for (auto item:fields) if (item) SendMessageW(item,WM_SETFONT,reinterpret_cast<WPARAM>(next),TRUE);
+    for (auto item:{playlistList,entryLabel,entrySeconds}) if (item) SendMessageW(item,WM_SETFONT,reinterpret_cast<WPARAM>(next),TRUE);
+    if (playlistList) SendMessageW(playlistList,LB_SETITEMHEIGHT,0,px(44));
     if (font) DeleteObject(font);
     font=next;
 }
@@ -247,12 +354,24 @@ void createControls() {
     button(3,101,L"Получить ID  ↗"); button(4,102,L"Применить статус"); button(5,103,L"Скрыть статус");
     button(6,104,L"Сбросить таймер"); button(7,105,L"Импорт профиля"); button(8,106,L"Экспорт профиля");
     button(9,107,L"Свернуть в трей  ↘");
+    button(10,113,L"04   Автосмена");
+    button(11,120,L"+ Добавить"); button(12,121,L"Заменить"); button(13,122,L"Удалить");
+    button(14,123,L"Редактировать статус"); button(15,124,L"↑ Выше"); button(16,125,L"↓ Ниже");
+    button(17,126,L"Запустить цикл"); button(18,127,L"Остановить цикл");
+    playlistList=CreateWindowExW(0,L"LISTBOX",L"Список статусов",WS_CHILD|WS_TABSTOP|WS_VSCROLL|LBS_NOTIFY|LBS_OWNERDRAWFIXED|LBS_HASSTRINGS|LBS_NOINTEGRALHEIGHT,
+        0,0,0,0,window,reinterpret_cast<HMENU>(230),GetModuleHandleW(nullptr),nullptr);
+    entryLabel=CreateWindowExW(0,L"EDIT",L"",WS_CHILD|WS_TABSTOP|ES_AUTOHSCROLL,
+        0,0,0,0,window,reinterpret_cast<HMENU>(231),GetModuleHandleW(nullptr),nullptr);
+    entrySeconds=CreateWindowExW(0,L"EDIT",L"60",WS_CHILD|WS_TABSTOP|ES_AUTOHSCROLL|ES_NUMBER,
+        0,0,0,0,window,reinterpret_cast<HMENU>(232),GetModuleHandleW(nullptr),nullptr);
+    SendMessageW(entryLabel,EM_SETLIMITTEXT,64,0); SendMessageW(entrySeconds,EM_SETLIMITTEXT,5,0);
+    for (HWND item:{entryLabel,entrySeconds}) SetWindowSubclass(item,editProcedure,1,0);
     updateFonts(); SendMessageW(fields[8],CB_SETITEMHEIGHT,static_cast<WPARAM>(-1),px(28));
     SendMessageW(fields[8],CB_SETITEMHEIGHT,0,px(32));
     const wchar_t* cues[]={L"Например, 123456789012345678",L"Во что вы играете?",L"Занят любимым делом",L"В своём ритме",
         L"Ключ Art Assets или https://…",L"Что это за картинка?",L"Ключ Art Assets или https://…",L"Подпись при наведении"};
     for (int i=0;i<8;++i) if (i!=2 && i!=3) SendMessageW(fields[i],EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(cues[i]));
-    layout();
+    refreshPlaylist(); layout();
 }
 void drawButton(const DRAWITEMSTRUCT& draw) {
     RECT bounds=draw.rcItem; int w=bounds.right-bounds.left,h=bounds.bottom-bounds.top;
@@ -260,13 +379,14 @@ void drawButton(const DRAWITEMSTRUCT& draw) {
     canvas->clear();
     POINT cursor; GetCursorPos(&cursor); ScreenToClient(draw.hwndItem,&cursor);
     bool hover=PtInRect(&bounds,cursor)!=FALSE, down=(draw.itemState&ODS_SELECTED)!=0;
-    bool selected=draw.CtlID>=110 && draw.CtlID<=112 && page==static_cast<int>(draw.CtlID)-110;
-    bool primary=draw.CtlID==102;
+    bool selected=draw.CtlID>=110 && draw.CtlID<=113 && page==static_cast<int>(draw.CtlID)-110;
+    bool primary=draw.CtlID==102 || draw.CtlID==126;
     UINT32 fill=primary?(down?0x6552d6:hover?0x9a8bff:0x8271f3):selected?0x272443:hover?0x202c40:0x172131;
     Box b{1,1,w*96.f/dpi-2,h*96.f/dpi-2};
     canvas->box(b,fill,9,selected?0x6154a2:primary?0x9f91ff:design::Border);
     wchar_t text[128]; GetWindowTextW(draw.hwndItem,text,128);
-    canvas->text(text,{b.x+8,b.y,b.w-16,b.h},14,primary?0xffffff:selected?0xd9d1ff:design::Text,true,DWRITE_TEXT_ALIGNMENT_CENTER,true);
+    bool disabled=(draw.itemState&ODS_DISABLED)!=0;
+    canvas->text(text,{b.x+8,b.y,b.w-16,b.h},14,disabled?0x6b7890:primary?0xffffff:selected?0xd9d1ff:design::Text,true,DWRITE_TEXT_ALIGNMENT_CENTER,true);
     if (draw.itemState&ODS_FOCUS) canvas->box({3,3,b.w-4,b.h-4},fill,7,design::Accent);
     // Redraw the label after the focus ring's fill.
     if (draw.itemState&ODS_FOCUS) canvas->text(text,{b.x+8,b.y,b.w-16,b.h},14,0xffffff,true,DWRITE_TEXT_ALIGNMENT_CENTER,true);
@@ -278,6 +398,20 @@ void drawCombo(const DRAWITEMSTRUCT& draw) {
     canvas->clear((draw.itemState&ODS_SELECTED)?0x302a53:design::Input);
     wchar_t text[128]; SendMessageW(fields[8],CB_GETLBTEXT,draw.itemID,reinterpret_cast<LPARAM>(text));
     canvas->text(text,{6,0,(draw.rcItem.right-draw.rcItem.left)*96.f/dpi-12,(draw.rcItem.bottom-draw.rcItem.top)*96.f/dpi},15,design::Text,false,DWRITE_TEXT_ALIGNMENT_LEADING,true);
+    canvas->end();
+}
+void drawPlaylistItem(const DRAWITEMSTRUCT& draw) {
+    if (draw.itemID==static_cast<UINT>(-1) || draw.itemID>=playlist.size()) return;
+    if (!canvas->begin(draw.hDC,draw.rcItem,dpi)) return;
+    bool selected=(draw.itemState&ODS_SELECTED)!=0;
+    canvas->clear(selected?0x302a53:design::Input);
+    float w=(draw.rcItem.right-draw.rcItem.left)*96.f/dpi;
+    const auto& entry=playlist[draw.itemID];
+    auto label=std::to_wstring(draw.itemID+1)+L". "+wide(entry.label);
+    if (player.isPlaying() && player.currentIndex()==draw.itemID) label=L"● "+label;
+    canvas->text(label,{12,3,w-125,22},14,design::Text,true);
+    canvas->text(wide(entry.presence.name),{12,25,w-125,18},11,design::Muted);
+    canvas->text(std::to_wstring(entry.seconds)+L" сек.",{w-105,0,90,44},13,design::Accent,false,DWRITE_TEXT_ALIGNMENT_TRAILING,true);
     canvas->end();
 }
 void drawInput(int index) {
@@ -303,8 +437,8 @@ void paint() {
         c.text(L"Ваш статус. Ваш стиль.",{95,65,460,24},14,design::Muted);
         c.line(32,94,width-32,94,0x202a3b);
         c.box({32,174,leftWidth(),442},design::Panel,16,design::Border);
-        const wchar_t* titles[]={L"Создайте своё присутствие",L"Добавьте характер",L"Задайте свой ритм"};
-        const wchar_t* descriptions[]={L"Название и две строки, которые расскажут о вас.",L"Большая обложка, маленькая деталь — ваш визуальный стиль.",L"Пусть время и смена текста работают за вас."};
+        const wchar_t* titles[]={L"Создайте своё присутствие",L"Добавьте характер",L"Задайте свой ритм",L"Статусы по кругу"};
+        const wchar_t* descriptions[]={L"Название и две строки, которые расскажут о вас.",L"Большая обложка, маленькая деталь — ваш визуальный стиль.",L"Пусть время и смена текста работают за вас.",L"Настройте поля во вкладках и добавьте статус в список."};
         c.text(titles[page],{56,197,leftWidth()-48,32},23,design::Text,true);
         c.text(descriptions[page],{56,237,leftWidth()-48,24},14,design::Muted);
         if (page==0) {
@@ -318,13 +452,21 @@ void paint() {
         } else if (page==1) {
             const wchar_t* labels[]={L"БОЛЬШАЯ КАРТИНКА · КЛЮЧ ИЛИ HTTPS URL",L"ПОДПИСЬ БОЛЬШОЙ КАРТИНКИ",L"МАЛАЯ КАРТИНКА · КЛЮЧ ИЛИ HTTPS URL",L"ПОДПИСЬ МАЛОЙ КАРТИНКИ"};
             for (int i=4;i<8;++i) { c.text(labels[i-4],{56,inputBoxes[i].y-23,leftWidth()-48,19},12,design::Muted,true); drawInput(i); }
-        } else {
+        } else if (page==2) {
             c.text(L"РЕЖИМ ТАЙМЕРА",{56,271,400,19},12,design::Muted,true); drawInput(8);
             c.text(L"МИНУТЫ",{56,371,170,19},12,design::Muted,true); drawInput(9);
             c.text(L"Для прошедшего времени — сколько уже прошло.\nДля отсчёта — сколько осталось.",{248,386,leftWidth()-240,58},14,design::Muted);
-            c.text(L"АВТОСМЕНА · СЕКУНДЫ",{56,477,230,19},12,design::Muted,true); drawInput(10);
+            c.text(L"СМЕНА ТЕКСТА · СЕКУНДЫ",{56,477,230,19},12,design::Muted,true); drawInput(10);
             c.text(L"От 15 секунд. Меняет оба списка текстов\nпо очереди, пока приложение работает.",{248,493,leftWidth()-240,58},14,design::Muted);
             c.text(L"«Применить» сохраняет таймер. «Сбросить» запускает заново.",{56,580,leftWidth()-48,28},13,design::Muted);
+        } else {
+            float inner=leftWidth()-48;
+            c.box({55,271,inner+2,142},design::Input,9,design::Border);
+            c.text(L"НАЗВАНИЕ В СПИСКЕ",{56,423,inner-190,19},12,design::Muted,true);
+            c.text(L"ПОКАЗ · СЕКУНДЫ",{56+inner-170,423,170,19},12,design::Muted,true);
+            c.box({56,442,inner-190,42},design::Input,9,GetFocus()==entryLabel?design::Accent:design::Border);
+            c.box({56+inner-170,442,170,42},design::Input,9,GetFocus()==entrySeconds?design::Accent:design::Border);
+            c.text(L"От 15 секунд. После последнего статуса — снова первый.",{56,592,inner,18},12,design::Muted);
         }
         float x=rightX();
         c.box({x,174,332,304},0x171e2e,16,0x36415b);
@@ -333,7 +475,9 @@ void paint() {
         // A vector placeholder: artwork itself is rendered by Discord.
         c.mark(x+34,248,42);
         c.dot(x+300,205,4,running?design::Green:0x6a7890);
-        auto name=value(1), details=presence::selected(value(2),rotation), state=presence::selected(value(3),rotation);
+        auto name=player.isPlaying()?active.name:value(1);
+        auto details=presence::selected(player.isPlaying()?active.details:value(2),rotation);
+        auto state=presence::selected(player.isPlaying()?active.state:value(3),rotation);
         c.text(wide(name.empty()?"Ваша игра":name),{x+106,240,202,62},21,design::Text,true);
         c.text(wide(details.empty()?"Занят любимым делом":details),{x+24,322,284,38},16,0xe0e6f4);
         c.text(wide(state.empty()?"В своём ритме":state),{x+24,369,284,38},14,design::Muted);
@@ -341,15 +485,21 @@ void paint() {
         c.dot(x+38,439,3,design::Green);
         c.text(timerText(),{x+49,424,247,30},13,design::Green,false,DWRITE_TEXT_ALIGNMENT_LEADING,true);
         c.box({x,494,332,122},design::Panel,16,design::Border);
-        c.text(L"Всегда на связи",{x+24,513,284,28},17,design::Text,true);
-        c.text(L"Крестик спрячет окно в трей.\nСтатус, таймер и автосмена\nпродолжат работать в фоне.",{x+24,548,284,58},13,design::Muted);
+        if (player.isPlaying()) {
+            c.text(L"Цикл · "+std::to_wstring(player.currentIndex()+1)+L" / "+std::to_wstring(playlist.size()),{x+24,513,284,28},17,design::Green,true);
+            c.text(wide(player.current().label),{x+24,548,284,22},13,design::Text,true);
+            c.text(L"До смены: "+std::to_wstring(player.remainingSeconds(GetTickCount64()))+L" сек. · Работает и в трее.",{x+24,577,284,25},12,design::Muted);
+        } else {
+            c.text(L"Всегда на связи",{x+24,513,284,28},17,design::Text,true);
+            c.text(L"Крестик спрячет окно в трей.\nСтатус, таймер и автосмена\nпродолжат работать в фоне.",{x+24,548,284,58},13,design::Muted);
+        }
         c.dot(x+8,653,4,design::Green);
         c.text(L"Без токенов и паролей",{x+23,641,309,24},14,design::Text,true);
         c.text(page==1?L"Картинки проверяйте в профиле Discord.":L"Прямое подключение к вашему Discord.",{x+23,666,309,24},12,design::Muted);
         c.line(32,709,width-32,709,0x202a3b);
         c.dot(39,731,4,running?design::Green:design::Accent);
         c.text(status,{54,717,width-200,30},13,design::Muted,false,DWRITE_TEXT_ALIGNMENT_LEADING,true);
-        c.text(L"v1.1.0",{width-108,717,76,30},12,0x71829d,false,DWRITE_TEXT_ALIGNMENT_TRAILING,true);
+        c.text(L"v1.2.0",{width-108,717,76,30},12,0x71829d,false,DWRITE_TEXT_ALIGNMENT_TRAILING,true);
         c.end(); BitBlt(screen,0,0,bounds.right,bounds.bottom,buffer,0,0,SRCCOPY);
     }
     SelectObject(buffer,old); DeleteObject(bitmap); DeleteDC(buffer); EndPaint(window,&ps);
@@ -365,7 +515,12 @@ LRESULT CALLBACK procedure(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     case WM_CREATE: {
         window=hwnd; dpi=GetDpiForWindow(hwnd); createControls();
         fill(presence::Settings{});
-        try { if (std::filesystem::exists(settingsPath)) fill(load(settingsPath)); }
+        try {
+            if (std::filesystem::exists(settingsPath)) {
+                auto loaded=load(settingsPath); savedDraft=loaded.draft;
+                playlist=std::move(loaded.playlist); fill(savedDraft); refreshPlaylist();
+            }
+        }
         catch (const std::exception& e) { status=L"Профиль не загружен: "+wide(e.what()); }
         rpc=std::make_unique<DiscordIpc>([hwnd](std::string text) {
             auto payload=new std::wstring(wide(text));
@@ -377,10 +532,11 @@ LRESULT CALLBACK procedure(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
     case WM_COMMAND:
         try {
             int id=LOWORD(wp);
-            if (id>=110 && id<=112) {
+            if (id>=110 && id<=113) {
                 page=id-110; layout();
                 for (int i=0;i<3;++i) InvalidateRect(buttons[i],nullptr,FALSE);
-                SetFocus(buttons[page]);
+                InvalidateRect(buttons[10],nullptr,FALSE);
+                SetFocus(page==3?buttons[10]:buttons[page]);
             }
             switch (id) {
             case 101: ShellExecuteW(hwnd,L"open",L"https://discord.com/developers/applications",nullptr,nullptr,SW_SHOWNORMAL); break;
@@ -390,6 +546,20 @@ LRESULT CALLBACK procedure(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
             case 105: profile(false); break;
             case 106: profile(true); break;
             case 107: minimizeToTray(); break;
+            case 120: case 121: case 122: case 124: case 125: changePlaylist(id); break;
+            case 123: {
+                auto selected=selectedEntry();
+                if (selected>=0) {
+                    fill(playlist.at(static_cast<size_t>(selected)).presence);
+                    SendMessageW(hwnd,WM_COMMAND,110,0);
+                    status=L"Статус загружен в форму. После правок откройте «Автосмена» и нажмите «Заменить».";
+                    repaint();
+                }
+                break;
+            }
+            case 126: startCycle(); break;
+            case 127: stopCycle(); break;
+            case 230: if (HIWORD(wp)==LBN_SELCHANGE) selectMetadata(); break;
             case ShowCommand: restoreWindow(); break;
             case ExitCommand: exitApplication(); return 0;
             }
@@ -398,18 +568,28 @@ LRESULT CALLBACK procedure(HWND hwnd,UINT message,WPARAM wp,LPARAM lp) {
         return 0;
     case WM_DRAWITEM: {
         auto& draw=*reinterpret_cast<DRAWITEMSTRUCT*>(lp);
-        if (draw.CtlType==ODT_BUTTON) drawButton(draw); else if (draw.CtlType==ODT_COMBOBOX) drawCombo(draw);
+        if (draw.CtlType==ODT_BUTTON) drawButton(draw);
+        else if (draw.CtlType==ODT_COMBOBOX) drawCombo(draw);
+        else if (draw.CtlType==ODT_LISTBOX) drawPlaylistItem(draw);
         return TRUE;
     }
-    case WM_MEASUREITEM: reinterpret_cast<MEASUREITEMSTRUCT*>(lp)->itemHeight=px(30); return TRUE;
-    case WM_TIMER:
-        if (running && GetTickCount64()-lastRotation>=static_cast<ULONGLONG>(active.interval)*1000) {
-            lastRotation=GetTickCount64();
+    case WM_MEASUREITEM: {
+        auto item=reinterpret_cast<MEASUREITEMSTRUCT*>(lp);
+        item->itemHeight=px(item->CtlType==ODT_LISTBOX?44.f:30.f); return TRUE;
+    }
+    case WM_TIMER: {
+        auto now=GetTickCount64();
+        if (player.tick(now)) {
+            activateCycleEntry(now); InvalidateRect(playlistList,nullptr,FALSE);
+        }
+        if (running && now-lastRotation>=static_cast<ULONGLONG>(active.interval)*1000) {
+            lastRotation=now;
             if (presence::lines(active.details).size()>1 || presence::lines(active.state).size()>1)
                 rpc->update(active.clientId,presence::activity(active,++rotation,epoch));
         }
         if (running) repaint();
         return 0;
+    }
     case StatusMessage: {
         std::unique_ptr<std::wstring> payload(reinterpret_cast<std::wstring*>(lp)); status=*payload;
         updateTray(); repaint(); return 0;
